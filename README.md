@@ -1,6 +1,6 @@
 # yt-bckp
 
-A local, open-source YouTube downloader for macOS. Paste one URL or a whole
+A local, open-source YouTube downloader. Paste one URL or a whole
 batch, pick **MP3** (audio) or **MP4** (video), and yt-bckp saves the files to a
 local `downloads/` folder. It runs entirely on your machine through a tiny web
 UI — no accounts, no cloud, no tracking.
@@ -12,9 +12,10 @@ UI — no accounts, no cloud, no tracking.
 
 ## Requirements
 
-- macOS
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and [`ffmpeg`](https://ffmpeg.org/) on your `PATH`
 - `python3` (3.14 recommended)
+
+### macOS
 
 Install everything with Homebrew:
 
@@ -24,6 +25,31 @@ brew install yt-dlp ffmpeg
 
 `python3` is also available via Homebrew (`brew install python`). If you ran the
 command above and already have a Homebrew `python3`, you're ready to go.
+
+### Linux
+
+Use your distribution's package manager. `python3` is preinstalled on most
+distros; install it alongside the others if it isn't.
+
+```bash
+# Debian / Ubuntu
+sudo apt install yt-dlp ffmpeg python3
+
+# Fedora
+sudo dnf install yt-dlp ffmpeg python3
+
+# Arch
+sudo pacman -S yt-dlp ffmpeg python
+
+# openSUSE
+sudo zypper install yt-dlp ffmpeg python3
+```
+
+If your distro packages an outdated `yt-dlp` (YouTube changes often, so a stale
+build may fail), grab the latest from [pip](https://pypi.org/project/yt-dlp/)
+(`pipx install yt-dlp` or `python3 -m pip install -U yt-dlp`) or the
+[official binary](https://github.com/yt-dlp/yt-dlp#installation), and make sure
+it's on your `PATH`.
 
 ## Run
 
