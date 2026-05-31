@@ -1,0 +1,13 @@
+# Downloaded media
+downloads/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# yt-dlp partial / temp files
+*.part
+*.ytdl

@@ -1,0 +1,14 @@
+services:
+  yt-bckp:
+    build: .
+    container_name: yt-bckp
+    ports:
+      - "8723:8723"          # host:container — browse http://<server-ip>:8723
+    volumes:
+      # Point the left side at ANY path on your server where you want files saved.
+      - ./downloads:/downloads
+    environment:
+      - PUID=1000            # `id -u` of the user that should own downloads
+      - PGID=1000            # `id -g` of that user
+      # - YT_BCKP_PORT=8723  # change the in-container port if you like
+    restart: unless-stopped

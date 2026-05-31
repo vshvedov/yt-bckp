@@ -1,0 +1,9 @@
+downloads/
+__pycache__/
+*.pyc
+.git
+.gitignore
+.DS_Store
+*.part
+*.ytdl
+README.md
