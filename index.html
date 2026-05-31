@@ -36,6 +36,8 @@
     background:
       radial-gradient(1200px 600px at 50% -10%, rgba(255,77,77,.10), transparent 60%),
       var(--bg);
+    background-repeat: no-repeat;   /* don't tile the halo down a tall page */
+    background-attachment: fixed;   /* keep it anchored to the viewport top */
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
                  Roboto, Helvetica, Arial, sans-serif;
@@ -264,6 +266,28 @@
   .jobs-head .count {
     font-size: 12.5px;
     color: var(--text-mute);
+  }
+  .jobs-head-right {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  .clear-btn {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-mute);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .clear-btn:hover {
+    color: var(--err);
+    border-color: rgba(248,113,113,.5);
+    background: rgba(248,113,113,.08);
   }
 
   .empty {
@@ -512,7 +536,10 @@
     <!-- Jobs -->
     <div class="jobs-head">
       <h2>Downloads</h2>
-      <span class="count" id="jobs-count"></span>
+      <div class="jobs-head-right">
+        <span class="count" id="jobs-count"></span>
+        <button type="button" id="clear-btn" class="clear-btn" hidden>Clear history</button>
+      </div>
     </div>
     <div id="jobs"></div>
 
@@ -548,6 +575,7 @@
 const API = {
   download: "/api/download",
   check:    "/api/check",
+  clear:    "/api/clear",
   jobs:     "/api/jobs",
   events:   "/api/events",
   reveal:   "/api/reveal",
@@ -580,11 +608,32 @@ const els = {
   pagerPrev: document.getElementById("pager-prev"),
   pagerNext: document.getElementById("pager-next"),
   pagerInfo: document.getElementById("pager-info"),
+  clear:     document.getElementById("clear-btn"),
 };
 
 /* ---------- Pagination controls ---------- */
 els.pagerPrev.addEventListener("click", () => { currentPage--; renderJobs(latestJobs); });
 els.pagerNext.addEventListener("click", () => { currentPage++; renderJobs(latestJobs); });
+
+/* ---------- Clear finished downloads from history ---------- */
+els.clear.addEventListener("click", async () => {
+  const finished = latestJobs.filter(
+    (j) => j.status === "done" || j.status === "error").length;
+  if (!finished) return;
+  const msg = "Delete " + finished + " finished download"
+    + (finished === 1 ? "" : "s") + " from history?\n\n"
+    + "This clears the list and the saved database. Your downloaded files are "
+    + "NOT deleted. Active downloads keep running.";
+  if (!window.confirm(msg)) return;
+  try {
+    const res = await fetch(API.clear, { method: "POST" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    currentPage = 0;
+    refreshJobs(); // SSE will also push, but refresh immediately for snappiness
+  } catch (err) {
+    showBanner("Could not clear history (" + err.message + ").");
+  }
+});
 
 /* ---------- Cookies toggle: enable the browser picker only when checked ---------- */
 els.cookiesOn.addEventListener("change", () => {
@@ -774,6 +823,11 @@ function renderJob(job, queuePos) {
   const div = document.createElement("div");
   div.className = "job";
   div.dataset.id = job.id;
+  // Visual signature: if it's unchanged between renders we reuse the existing
+  // node instead of rebuilding it, so looping CSS animations (the amber/queued
+  // shimmer) don't restart and twitch on every SSE frame. See renderJobs().
+  div.dataset.sig = [status, barClass, Math.round(barFill), pctText,
+                     headline, job.filename || "", canReveal].join("|");
   div.innerHTML = `
     <div class="job-top">
       <span class="job-title">${linkHtml}</span>
@@ -785,27 +839,33 @@ function renderJob(job, queuePos) {
       <span class="job-pct">${escapeHtml(pctText)}</span>
       ${footRight}
     </div>`;
+  const reveal = div.querySelector("[data-reveal]");
+  if (reveal) reveal.addEventListener("click", () => revealJob(job.id));
   return div;
 }
 
 /* ---------- Render the whole list (paginated) ---------- */
 function renderJobs(jobs) {
   latestJobs = jobs || [];
-  els.jobs.innerHTML = "";
 
   if (latestJobs.length === 0) {
+    els.jobs.innerHTML = "";
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No downloads yet. Paste some URLs above to get started.";
     els.jobs.appendChild(empty);
     els.count.textContent = "";
     els.pager.hidden = true;
+    els.clear.hidden = true;
     return;
   }
 
   const downloading = latestJobs.filter((j) => j.status === "downloading").length;
   const processing = latestJobs.filter((j) => j.status === "processing").length;
   const queued = latestJobs.filter((j) => j.status === "queued").length;
+  const finished = latestJobs.filter(
+    (j) => j.status === "done" || j.status === "error").length;
+  els.clear.hidden = finished === 0;
   const parts = [];
   if (downloading) parts.push(downloading + " downloading");
   if (processing) parts.push(processing + " processing");
@@ -825,13 +885,37 @@ function renderJobs(jobs) {
   const start = currentPage * PAGE_SIZE;
   const pageJobs = latestJobs.slice(start, start + PAGE_SIZE);
 
-  const frag = document.createDocumentFragment();
-  pageJobs.forEach((job) => frag.appendChild(renderJob(job, posById[job.id])));
-  els.jobs.appendChild(frag);
+  // Reconcile against the existing DOM rather than wiping it. For each job we
+  // reuse the current node when its visual signature is identical (preserving
+  // any running shimmer animation), and only build a fresh node when something
+  // actually changed. Then we order nodes to match and drop any stragglers.
+  const existing = {};
+  Array.from(els.jobs.children).forEach((el) => { existing[el.dataset.id] = el; });
 
-  // Wire up reveal links (delegation via fresh nodes).
-  els.jobs.querySelectorAll("[data-reveal]").forEach((a) => {
-    a.addEventListener("click", () => revealJob(a.getAttribute("data-reveal")));
+  const wanted = new Set();
+  let prev = null;
+  pageJobs.forEach((job) => {
+    wanted.add(job.id);
+    const fresh = renderJob(job, posById[job.id]);
+    const old = existing[job.id];
+    let node;
+    if (old && old.dataset.sig === fresh.dataset.sig) {
+      node = old;             // unchanged → keep the live node (and its animation)
+    } else if (old) {
+      els.jobs.replaceChild(fresh, old);  // changed → swap in place
+      node = fresh;
+    } else {
+      node = fresh;           // new job
+    }
+    // Position node right after the previous one to match the desired order.
+    const after = prev ? prev.nextSibling : els.jobs.firstChild;
+    if (node !== after) els.jobs.insertBefore(node, after);
+    prev = node;
+  });
+
+  // Remove nodes for jobs no longer on this page.
+  Array.from(els.jobs.children).forEach((el) => {
+    if (!wanted.has(el.dataset.id)) els.jobs.removeChild(el);
   });
 
   // Pager controls.

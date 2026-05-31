@@ -17,6 +17,7 @@ Endpoints:
     GET  /api/config        -> { can_reveal, download_dir, versions }
     POST /api/download      -> enqueue downloads onto the worker pool
     POST /api/check         -> { existing: [urls already downloaded for a format] }
+    POST /api/clear         -> delete finished jobs from history; { removed: N }
     GET  /api/jobs          -> list jobs (newest first)
     GET  /api/events        -> Server-Sent Events stream of live job updates
     GET  /api/reveal?id=ID  -> reveal a finished file in Finder (macOS host)
@@ -291,6 +292,24 @@ def load_jobs():
         )
         rows = cur.fetchall()
     return [dict(zip(_JOB_COLUMNS, r)) for r in rows]
+
+
+def clear_history():
+    """Delete all FINISHED jobs (done/error) from memory and the DB. Active
+    jobs (queued/downloading/processing) are left running. Returns the count
+    removed."""
+    with JOBS_LOCK:
+        remove = [jid for jid, j in JOBS.items()
+                  if j.get("status") in ("done", "error")]
+        for jid in remove:
+            del JOBS[jid]
+    if _DB is not None and remove:
+        with DB_LOCK:
+            _DB.executemany("DELETE FROM jobs WHERE id = ?",
+                            [(jid,) for jid in remove])
+            _DB.commit()
+    broadcast()
+    return len(remove)
 
 
 def enqueue(job_id):
@@ -692,6 +711,9 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_download()
         elif parsed.path == "/api/check":
             self._handle_check()
+        elif parsed.path == "/api/clear":
+            removed = clear_history()
+            self._send_json({"ok": True, "removed": removed})
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -927,9 +949,10 @@ def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(INCOMPLETE_DIR, exist_ok=True)
 
-    # Default the DB to a hidden file inside the (now resolved) download dir.
+    # Default the DB to a file inside the staging dir, so it lives alongside
+    # other app state and never clutters the user-facing downloads folder.
     if DB_PATH is None:
-        DB_PATH = os.path.join(DOWNLOAD_DIR, ".yt-bckp.db")
+        DB_PATH = os.path.join(INCOMPLETE_DIR, "yt-bckp.db")
 
     # Bring up persistence and the worker pool, then recover any unfinished jobs.
     init_db(DB_PATH)
