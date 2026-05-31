@@ -531,6 +531,18 @@
         &ldquo;confirm you&rsquo;re not a bot.&rdquo; Cookies are read locally and sent only to YouTube.
         Quit the selected browser first if cookie access fails.
       </p>
+
+      <!-- Optional: expand playlists into one download per video -->
+      <div class="cookies-row">
+        <label class="cookie-toggle" for="playlist-enabled">
+          <input type="checkbox" id="playlist-enabled" />
+          <span>Download full playlists</span>
+        </label>
+      </div>
+      <p class="cookie-hint" id="playlist-hint">
+        Off by default: a link with a playlist (<code>&amp;list=…</code>) downloads only that one
+        video. Turn this on to download every video in a pasted playlist, one file each.
+      </p>
     </section>
 
     <!-- Jobs -->
@@ -602,6 +614,8 @@ const els = {
   bannerTxt: document.getElementById("banner-text"),
   cookiesOn: document.getElementById("cookies-enabled"),
   cookiesBrowser: document.getElementById("cookies-browser"),
+  playlistOn: document.getElementById("playlist-enabled"),
+  playlistHint: document.getElementById("playlist-hint"),
   downloadDir: document.getElementById("download-dir"),
   versions:  document.getElementById("versions"),
   pager:     document.getElementById("pager"),
@@ -696,19 +710,23 @@ async function submitDownload() {
 
   // Optionally borrow browser cookies (age-restricted / private / bot checks).
   const cookies = els.cookiesOn.checked ? els.cookiesBrowser.value : null;
+  const playlist = els.playlistOn.checked;
 
   try {
     // First: ask which of these were already downloaded for this format, and
-    // confirm before re-downloading (overwriting) them.
+    // confirm before re-downloading (overwriting) them. Skipped in playlist
+    // mode, where the pasted URLs are playlists, not the individual videos.
     let existing = [];
-    try {
-      const chk = await fetch(API.check, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls, format: selectedFormat }),
-      });
-      if (chk.ok) existing = (await chk.json()).existing || [];
-    } catch (_) { /* check is best-effort; proceed if it fails */ }
+    if (!playlist) {
+      try {
+        const chk = await fetch(API.check, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls, format: selectedFormat }),
+        });
+        if (chk.ok) existing = (await chk.json()).existing || [];
+      } catch (_) { /* check is best-effort; proceed if it fails */ }
+    }
 
     if (existing.length) {
       const n = existing.length;
@@ -731,11 +749,11 @@ async function submitDownload() {
     const res = await fetch(API.download, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ urls, format: selectedFormat, cookies }),
+      body: JSON.stringify({ urls, format: selectedFormat, cookies, playlist }),
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
 
-    await res.json(); // { jobs: [...] } — we don't need it; poller will refresh.
+    await res.json(); // ack — jobs arrive live via SSE (playlist expansion is async).
 
     hideBanner();
     els.urls.value = ""; // clear on success

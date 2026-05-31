@@ -14,8 +14,9 @@ were in flight are re-queued on the next boot.
 
 Endpoints:
     GET  /                  -> serves index.html
-    GET  /api/config        -> { can_reveal, download_dir, versions }
+    GET  /api/config        -> { can_reveal, download_dir, versions, max_playlist }
     POST /api/download      -> enqueue downloads onto the worker pool
+                               (set {playlist:true} to expand playlists per-video)
     POST /api/check         -> { existing: [urls already downloaded for a format] }
     POST /api/clear         -> delete finished jobs from history; { removed: N }
     GET  /api/jobs          -> list jobs (newest first)
@@ -126,6 +127,11 @@ def get_versions():
 # avoids hammering the network/CPU and reduces the chance of YouTube throttling
 # or "confirm you're not a bot" challenges. Override with --jobs.
 MAX_CONCURRENT = int(os.environ.get("YT_BCKP_MAX_CONCURRENT", "3"))
+
+# When the user opts into playlist mode, a single playlist URL is expanded into
+# one job per video. This caps how many videos we'll pull from one playlist so a
+# huge list (or an endless auto-generated "mix") can't flood the queue.
+MAX_PLAYLIST = int(os.environ.get("YT_BCKP_MAX_PLAYLIST", "100"))
 
 # SQLite job database: durable history + a queue that survives restarts. Default
 # is a hidden file INSIDE the download dir (resolved in main(), since --dir can
@@ -452,7 +458,11 @@ def clean_filename(path):
 
 
 def build_command(url, fmt, cookies_browser=None):
-    """Return the yt-dlp argv list for the requested format."""
+    """Return the yt-dlp argv list for the requested format.
+
+    Always downloads a SINGLE video: playlists are expanded to one job (URL) per
+    video upstream (see expand_playlist), so each worker only ever fetches one.
+    """
     base = [
         YT_DLP,
         "--newline",            # emit progress on its own line so we can parse it
@@ -494,6 +504,39 @@ def build_command(url, fmt, cookies_browser=None):
         "--merge-output-format", "mp4",
         url,
     ]
+
+
+def expand_playlist(url, cookies_browser=None, limit=None):
+    """Resolve a playlist URL into a list of individual video watch URLs using a
+    fast flat extraction (no downloading). Returns a list of URLs.
+
+    A non-playlist URL flattens to itself (one entry). The result is capped at
+    `limit` (default MAX_PLAYLIST) so a giant list or an endless auto-mix can't
+    flood the queue. Returns [url] unchanged on any extraction error, so a
+    failed expansion degrades to a normal single download.
+    """
+    if limit is None:
+        limit = MAX_PLAYLIST
+    cmd = [
+        YT_DLP,
+        "--flat-playlist",          # list entries without downloading them
+        "--no-warnings",
+        "-I", "1:%d" % max(1, limit),   # only take the first `limit` entries
+        "--print", "%(id)s",
+    ]
+    if cookies_browser in ALLOWED_BROWSERS:
+        cmd += ["--cookies-from-browser", cookies_browser]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception:
+        return [url]
+    if proc.returncode != 0:
+        return [url]
+    ids = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not ids:
+        return [url]
+    return ["https://www.youtube.com/watch?v=" + vid for vid in ids[:limit]]
 
 
 def run_download(job_id):
@@ -695,6 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                 "can_reveal": CAN_REVEAL,
                 "download_dir": DOWNLOAD_DIR,
                 "versions": get_versions(),
+                "max_playlist": MAX_PLAYLIST,
             })
         elif path == "/api/jobs":
             self._send_json({"jobs": snapshot_jobs()})
@@ -786,6 +830,7 @@ class Handler(BaseHTTPRequestHandler):
         urls = data.get("urls")
         fmt = data.get("format", "mp3")
         cookies_browser = data.get("cookies")  # browser name, or None/falsy
+        playlist = bool(data.get("playlist"))  # expand playlists into per-video jobs
 
         # Validate inputs.
         if not isinstance(urls, list) or not urls:
@@ -802,20 +847,30 @@ class Handler(BaseHTTPRequestHandler):
         if cookies_browser not in ALLOWED_BROWSERS:
             cookies_browser = None
 
-        # Create one job per URL and hand it to the worker pool. The pool
-        # enforces the concurrency cap; extra jobs wait in the queue as "queued".
+        clean = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+        if not clean:
+            self._send_json({"error": "no valid urls provided"}, status=400)
+            return
+
+        if playlist:
+            # Expanding playlists hits the network, so do it off the request
+            # thread: respond immediately, then enqueue per-video jobs as each
+            # playlist resolves. New jobs appear live via SSE.
+            def expand_and_enqueue():
+                for url in clean:
+                    for video_url in expand_playlist(url, cookies_browser):
+                        job = new_job(video_url, fmt, cookies_browser)
+                        enqueue(job["id"])
+            threading.Thread(target=expand_and_enqueue, daemon=True).start()
+            self._send_json({"ok": True, "expanding": True})
+            return
+
+        # Non-playlist: one job per URL, enqueued immediately.
         jobs_out = []
-        for url in urls:
-            if not isinstance(url, str) or not url.strip():
-                continue
-            url = url.strip()
+        for url in clean:
             job = new_job(url, fmt, cookies_browser)
             jobs_out.append({"id": job["id"], "url": url})
             enqueue(job["id"])
-
-        if not jobs_out:
-            self._send_json({"error": "no valid urls provided"}, status=400)
-            return
 
         self._send_json({"jobs": jobs_out})
 
