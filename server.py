@@ -367,20 +367,64 @@ PP_MESSAGES = {
 ALREADY_RE = re.compile(r"\[download\]\s*(.+?)\s+has already been downloaded")
 
 
-def underscore_filename(path):
+# Non-alphanumeric characters kept verbatim in a sanitized filename stem.
+# Everything else (emoji, symbols like the fullwidth "｜", CJK punctuation,
+# control chars, shell-hostile chars) is dropped.
+_SAFE_FILENAME_CHARS = set("-_.()[]")
+
+
+def sanitize_basename(base):
+    """Return a filesystem-friendly version of a filename (stem + extension).
+
+    Drops emojis, symbols, and other 'weird' characters; turns whitespace into
+    underscores; collapses repeats and trims junk edges. Letters and digits from
+    ANY script are kept (via str.isalnum), so non-Latin titles survive instead of
+    becoming empty. The extension is preserved (lowercased, alnum-only).
     """
-    Rename a finished file so spaces in its name become underscores
-    (e.g. 'Me at the zoo.mp3' -> 'Me_at_the_zoo.mp3'). Only the filename is
-    touched, never the parent directory. Returns the new path, or the original
-    path unchanged if there are no spaces or the rename fails.
+    stem, ext = os.path.splitext(base)
+
+    kept = []
+    for ch in stem:
+        if ch.isspace():
+            kept.append(" ")              # normalize all whitespace to a space
+        elif ch.isalnum() or ch in _SAFE_FILENAME_CHARS:
+            kept.append(ch)
+        # else: emoji / symbol / punctuation -> dropped
+    cleaned = "".join(kept)
+
+    cleaned = re.sub(r"\s+", "_", cleaned)      # spaces -> underscores
+    cleaned = re.sub(r"_{2,}", "_", cleaned)    # collapse runs of underscores
+    cleaned = cleaned.strip("_.-")              # trim junk from the edges
+    if not cleaned:
+        cleaned = "download"                    # never produce an empty name
+
+    if ext:
+        ext = "." + re.sub(r"[^A-Za-z0-9]", "", ext.lstrip(".")).lower()
+    return cleaned + ext
+
+
+def clean_filename(path):
+    """Rename a finished file to a sanitized name (see sanitize_basename), only
+    touching the filename, never the parent directory. Avoids clobbering a
+    different existing file by appending _1, _2, … Returns the (possibly new)
+    path, or the original if no change is needed or the rename fails.
     """
     if not path or not os.path.exists(path):
         return path
     directory, base = os.path.split(path)
-    underscored = base.replace(" ", "_")
-    if underscored == base:
+    cleaned = sanitize_basename(base)
+    if cleaned == base:
         return path
-    target = os.path.join(directory, underscored)
+
+    target = os.path.join(directory, cleaned)
+    # If a *different* file already owns the sanitized name, pick a free suffix.
+    if os.path.abspath(target) != os.path.abspath(path) and os.path.exists(target):
+        stem, ext = os.path.splitext(cleaned)
+        n = 1
+        while os.path.exists(os.path.join(directory, f"{stem}_{n}{ext}")):
+            n += 1
+        target = os.path.join(directory, f"{stem}_{n}{ext}")
+
     try:
         os.replace(path, target)  # atomic within the same directory
         return target
@@ -560,8 +604,9 @@ def run_download(job_id):
 
     if filename:
         filename = os.path.abspath(filename)
-        # Store the final file with underscores instead of spaces in its name.
-        filename = underscore_filename(filename)
+        # Store the final file under a sanitized name: spaces -> underscores,
+        # emojis / symbols / weird characters stripped.
+        filename = clean_filename(filename)
 
     # ----------------------------------------------------------------------- #
     # Final status transition.
