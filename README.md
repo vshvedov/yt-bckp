@@ -8,6 +8,9 @@ UI — no accounts, no cloud, no tracking.
 - Single URL or batch (many URLs at once)
 - MP3 (best-quality audio extraction) or MP4 (best video + audio, merged)
 - Live progress for every job, with a "Reveal in Finder" button
+- Concurrency-limited queue — paste 50 links without 50 processes at once
+- Live progress + queue position, pushed over Server-Sent Events (no polling)
+- Job history persists across restarts (SQLite); interrupted jobs resume
 - Pure Python standard library backend (no Flask, no pip, no venv)
 
 ## Requirements
@@ -191,6 +194,8 @@ docker run -d --name yt-bckp -p 8723:8723 \
 | `YT_BCKP_HOST` | `0.0.0.0` | Bind address. `127.0.0.1` = local only; `0.0.0.0` = reachable on the network. |
 | `YT_BCKP_PORT` | `8723` | Port the server listens on. |
 | `YT_BCKP_DOWNLOAD_DIR` | `/downloads` | Where files are saved (mount a volume here). |
+| `YT_BCKP_MAX_CONCURRENT` | `3` | Max simultaneous downloads; the rest queue. |
+| `YT_BCKP_DB` | `<download-dir>/.yt-bckp.db` | SQLite job database (history + queue across restarts). Keep it on the mounted volume so it survives container restarts. |
 | `YT_BCKP_OPEN_BROWSER` | `0` | Auto-open a browser on start (desktop only; off in the container). |
 | `YT_BCKP_YTDLP` | `/usr/local/bin/yt-dlp` | Path to the `yt-dlp` binary. |
 | `PUID` / `PGID` | `1000` | User/group that owns files on the mounted volume. |
@@ -207,8 +212,11 @@ yt-bckp is a small HTTP server built on Python's standard library
 API; each download URL is handed to a background worker thread that shells out to
 `yt-dlp` (which in turn uses `ffmpeg`) via `subprocess`. The server parses
 `yt-dlp`'s line-by-line output to track progress, titles, and the final file
-path, and exposes that state back to the UI so you can watch jobs complete in
-real time. All downloaded files are written to the `downloads/` directory.
+path. Downloads run through a bounded worker pool (the concurrency cap) fed by a
+queue, and job state is persisted to a small SQLite database so history survives
+restarts and interrupted jobs are re-queued on the next boot. The UI gets live
+updates over Server-Sent Events — every change is pushed, no polling. All
+downloaded files are written to the `downloads/` directory.
 
 ## License & use
 

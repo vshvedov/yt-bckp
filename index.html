@@ -331,6 +331,8 @@
   .pill.queued .pdot      { background: var(--text-dim); }
   .pill.downloading { background: rgba(96,165,250,.14); color: #9cc4ff; }
   .pill.downloading .pdot { background: var(--info); animation: pulse 1.2s infinite; }
+  .pill.processing  { background: rgba(251,191,36,.14); color: #fcd34d; }
+  .pill.processing .pdot  { background: var(--warn); animation: pulse 1.2s infinite; }
   .pill.done        { background: rgba(52,211,153,.14); color: #7fe6c2; }
   .pill.done .pdot        { background: var(--ok); }
   .pill.error       { background: rgba(248,113,113,.14); color: #ffc1c1; }
@@ -353,11 +355,16 @@
   }
   .bar.done > span     { background: linear-gradient(90deg, var(--ok), #6ee7b7); }
   .bar.error > span    { background: linear-gradient(90deg, var(--err), #fca5a5); }
-  /* Indeterminate shimmer while queued */
-  .bar.queued > span {
+  /* Indeterminate shimmer while queued or post-processing (no % available) */
+  .bar.queued > span,
+  .bar.processing > span {
     width: 35% !important;
     background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent);
     animation: indet 1.3s linear infinite;
+  }
+  /* Tint the processing shimmer amber to match its status pill. */
+  .bar.processing > span {
+    background: linear-gradient(90deg, transparent, rgba(251,191,36,.45), transparent);
   }
   @keyframes indet {
     0%   { margin-left: -35%; }
@@ -404,6 +411,40 @@
     font-size: 12px;
     margin-top: 26px;
   }
+  footer code {
+    color: var(--text-dim);
+    background: var(--bg-elev);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 11.5px;
+    word-break: break-all;
+  }
+  .versions { margin-top: 6px; font-size: 11px; color: var(--text-mute); }
+  .versions .sep { opacity: .5; margin: 0 6px; }
+
+  /* ---------- Pagination ---------- */
+  .pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin: 6px 0 4px;
+  }
+  .pager-btn {
+    appearance: none;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+  .pager-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border-2); }
+  .pager-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .pager-info { font-size: 12px; color: var(--text-mute); font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -419,7 +460,7 @@
         </span>
         yt-bckp
       </div>
-      <div class="tagline">Local YouTube backup &middot; save videos as MP3 or MP4</div>
+      <div class="tagline">Local YouTube backup &middot; web UI for yt-dlp</div>
     </header>
 
     <!-- Connection / error banner -->
@@ -435,10 +476,10 @@
         placeholder="Paste one URL per line for a batch&#10;https://www.youtube.com/watch?v=...&#10;https://youtu.be/..."></textarea>
 
       <div class="controls">
-        <!-- Format toggle (default = MP4) -->
+        <!-- Format toggle (default = MP3) -->
         <div class="segmented" role="group" aria-label="Output format">
-          <button type="button" class="seg-btn" data-format="mp3">Audio &middot; MP3</button>
-          <button type="button" class="seg-btn active" data-format="mp4">Video &middot; MP4</button>
+          <button type="button" class="seg-btn active" data-format="mp3">Audio &middot; MP3</button>
+          <button type="button" class="seg-btn" data-format="mp4">Video &middot; MP4</button>
         </div>
 
         <button type="button" id="download-btn" class="btn-primary">Download</button>
@@ -475,7 +516,17 @@
     </div>
     <div id="jobs"></div>
 
-    <footer>Files are saved to <code>downloads/</code> &middot; runs entirely on your machine</footer>
+    <!-- Pagination for past downloads -->
+    <div id="pager" class="pager" hidden>
+      <button type="button" id="pager-prev" class="pager-btn">&lsaquo; Newer</button>
+      <span id="pager-info" class="pager-info"></span>
+      <button type="button" id="pager-next" class="pager-btn">Older &rsaquo;</button>
+    </div>
+
+    <footer>
+      <div>Files are saved to <code id="download-dir">downloads/</code></div>
+      <div id="versions" class="versions"></div>
+    </footer>
   </div>
 
 <script>
@@ -486,15 +537,19 @@
    Talks to the local Python stdlib backend on http://127.0.0.1:8723.
    API endpoints consumed (must match the backend contract exactly):
      POST /api/download      { urls:[...], format:"mp3"|"mp4", cookies?:"<browser>"|null }
+     POST /api/check         { urls:[...], format } -> { existing:[urls] }
      GET  /api/jobs          -> { jobs:[ JobObject, ... ] } (newest first)
+     GET  /api/events        -> Server-Sent Events: data: { jobs:[...] } per change
      GET  /api/reveal?id=ID  -> { ok:true }   (opens Finder, macOS host only)
-     GET  /api/config        -> { can_reveal:bool }
+     GET  /api/config        -> { can_reveal, download_dir, versions }
    ========================================================================= */
 
 // Same-origin: index.html is served by the backend, so relative paths work.
 const API = {
   download: "/api/download",
+  check:    "/api/check",
   jobs:     "/api/jobs",
+  events:   "/api/events",
   reveal:   "/api/reveal",
   config:   "/api/config",
 };
@@ -504,6 +559,9 @@ const API = {
 let canReveal = false;
 
 const POLL_MS = 1000;
+const PAGE_SIZE = 10;     // past downloads per page
+let currentPage = 0;      // 0-based; clamped on each render
+let latestJobs = [];      // last snapshot, so the pager can re-render
 
 /* ---------- DOM references ---------- */
 const els = {
@@ -516,7 +574,17 @@ const els = {
   bannerTxt: document.getElementById("banner-text"),
   cookiesOn: document.getElementById("cookies-enabled"),
   cookiesBrowser: document.getElementById("cookies-browser"),
+  downloadDir: document.getElementById("download-dir"),
+  versions:  document.getElementById("versions"),
+  pager:     document.getElementById("pager"),
+  pagerPrev: document.getElementById("pager-prev"),
+  pagerNext: document.getElementById("pager-next"),
+  pagerInfo: document.getElementById("pager-info"),
 };
+
+/* ---------- Pagination controls ---------- */
+els.pagerPrev.addEventListener("click", () => { currentPage--; renderJobs(latestJobs); });
+els.pagerNext.addEventListener("click", () => { currentPage++; renderJobs(latestJobs); });
 
 /* ---------- Cookies toggle: enable the browser picker only when checked ---------- */
 els.cookiesOn.addEventListener("change", () => {
@@ -524,7 +592,7 @@ els.cookiesOn.addEventListener("change", () => {
 });
 
 /* ---------- Format toggle state ---------- */
-let selectedFormat = "mp4"; // default per spec
+let selectedFormat = "mp3"; // default: audio
 
 els.segBtns.forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -562,7 +630,7 @@ function clampPct(n) {
 /* ---------- Submit (POST /api/download) ---------- */
 async function submitDownload() {
   // Split textarea by newlines, trim, drop empties.
-  const urls = els.urls.value
+  let urls = els.urls.value
     .split(/\r?\n/)
     .map((u) => u.trim())
     .filter((u) => u.length > 0);
@@ -581,6 +649,36 @@ async function submitDownload() {
   const cookies = els.cookiesOn.checked ? els.cookiesBrowser.value : null;
 
   try {
+    // First: ask which of these were already downloaded for this format, and
+    // confirm before re-downloading (overwriting) them.
+    let existing = [];
+    try {
+      const chk = await fetch(API.check, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls, format: selectedFormat }),
+      });
+      if (chk.ok) existing = (await chk.json()).existing || [];
+    } catch (_) { /* check is best-effort; proceed if it fails */ }
+
+    if (existing.length) {
+      const n = existing.length;
+      const msg = n === 1
+        ? "1 of these was already downloaded as " + selectedFormat.toUpperCase()
+          + ".\n\nOK = re-download (overwrite it).\nCancel = skip it and download the rest."
+        : n + " of these were already downloaded as " + selectedFormat.toUpperCase()
+          + ".\n\nOK = re-download (overwrite them).\nCancel = skip them and download the rest.";
+      if (!window.confirm(msg)) {
+        // Skip the already-downloaded ones.
+        const skip = new Set(existing);
+        urls = urls.filter((u) => !skip.has(u));
+        if (urls.length === 0) {
+          showBanner("Nothing to download — all of those are already saved.");
+          return;
+        }
+      }
+    }
+
     const res = await fetch(API.download, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -592,6 +690,7 @@ async function submitDownload() {
 
     hideBanner();
     els.urls.value = ""; // clear on success
+    currentPage = 0;     // jump to newest so the new jobs are visible
     refreshJobs();       // immediate refresh so new jobs appear instantly
   } catch (err) {
     showBanner("Could not start download — is the server running? (" + err.message + ")");
@@ -626,11 +725,14 @@ async function revealJob(id) {
 }
 
 /* ---------- Render a single job row ---------- */
-function renderJob(job) {
+// queuePos: 1-based position among waiting jobs, or 0/undefined if not queued.
+function renderJob(job, queuePos) {
   const status = job.status || "queued";
   const pct = clampPct(job.progress);
   const isDone = status === "done";
   const isErr = status === "error";
+  const isQueued = status === "queued";
+  const isProcessing = status === "processing";
 
   // Headline: title if known, otherwise the raw URL.
   const headline = job.title || job.url || "(unknown)";
@@ -640,9 +742,18 @@ function renderJob(job) {
 
   const fmt = (job.format === "mp3") ? "mp3" : "mp4";
 
-  // Bar fill: done forces 100%; queued uses the shimmer class.
+  // Bar fill: done forces 100%; queued / processing use the shimmer class.
   const barFill = isDone ? 100 : pct;
-  const barClass = isDone ? "done" : isErr ? "error" : (status === "queued" ? "queued" : "");
+  const barClass = isDone ? "done" : isErr ? "error"
+    : isQueued ? "queued" : isProcessing ? "processing" : "";
+
+  // Left-side status text under the bar.
+  let pctText;
+  if (isDone) pctText = "100%";
+  else if (isErr) pctText = "";
+  else if (isQueued) pctText = queuePos ? "Queued · #" + queuePos : "Queued";
+  else if (isProcessing) pctText = job.message || "Processing…";
+  else pctText = pct.toFixed(1) + "%";
 
   // Footer: reveal link (done), error text (error), or percentage (in progress).
   let footRight = "";
@@ -671,36 +782,69 @@ function renderJob(job) {
     </div>
     <div class="bar ${barClass}"><span style="width:${barFill}%"></span></div>
     <div class="job-foot">
-      <span class="job-pct">${isDone ? "100%" : isErr ? "" : (status === "queued" ? "Queued" : pct.toFixed(1) + "%")}</span>
+      <span class="job-pct">${escapeHtml(pctText)}</span>
       ${footRight}
     </div>`;
   return div;
 }
 
-/* ---------- Render the whole list ---------- */
+/* ---------- Render the whole list (paginated) ---------- */
 function renderJobs(jobs) {
+  latestJobs = jobs || [];
   els.jobs.innerHTML = "";
 
-  if (!jobs || jobs.length === 0) {
+  if (latestJobs.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No downloads yet. Paste some URLs above to get started.";
     els.jobs.appendChild(empty);
     els.count.textContent = "";
+    els.pager.hidden = true;
     return;
   }
 
-  const active = jobs.filter((j) => j.status === "downloading" || j.status === "queued").length;
-  els.count.textContent = jobs.length + " total" + (active ? " · " + active + " active" : "");
+  const downloading = latestJobs.filter((j) => j.status === "downloading").length;
+  const processing = latestJobs.filter((j) => j.status === "processing").length;
+  const queued = latestJobs.filter((j) => j.status === "queued").length;
+  const parts = [];
+  if (downloading) parts.push(downloading + " downloading");
+  if (processing) parts.push(processing + " processing");
+  if (queued) parts.push(queued + " queued");
+  els.count.textContent = latestJobs.length + " total" + (parts.length ? " · " + parts.join(" · ") : "");
+
+  // Queue position across the WHOLE list (not just this page): jobs are
+  // newest-first, so the oldest queued job is next up = position 1.
+  const queuedIds = latestJobs.filter((j) => j.status === "queued").map((j) => j.id);
+  const posById = {};
+  queuedIds.forEach((id, i) => { posById[id] = queuedIds.length - i; });
+
+  // Pagination: clamp current page to valid range, then slice.
+  const totalPages = Math.max(1, Math.ceil(latestJobs.length / PAGE_SIZE));
+  if (currentPage > totalPages - 1) currentPage = totalPages - 1;
+  if (currentPage < 0) currentPage = 0;
+  const start = currentPage * PAGE_SIZE;
+  const pageJobs = latestJobs.slice(start, start + PAGE_SIZE);
 
   const frag = document.createDocumentFragment();
-  jobs.forEach((job) => frag.appendChild(renderJob(job)));
+  pageJobs.forEach((job) => frag.appendChild(renderJob(job, posById[job.id])));
   els.jobs.appendChild(frag);
 
   // Wire up reveal links (delegation via fresh nodes).
   els.jobs.querySelectorAll("[data-reveal]").forEach((a) => {
     a.addEventListener("click", () => revealJob(a.getAttribute("data-reveal")));
   });
+
+  // Pager controls.
+  if (latestJobs.length > PAGE_SIZE) {
+    els.pager.hidden = false;
+    els.pagerPrev.disabled = currentPage === 0;
+    els.pagerNext.disabled = currentPage >= totalPages - 1;
+    els.pagerInfo.textContent =
+      "Page " + (currentPage + 1) + " of " + totalPages
+      + " · showing " + (start + 1) + "–" + (start + pageJobs.length);
+  } else {
+    els.pager.hidden = true;
+  }
 }
 
 /* ---------- Poll GET /api/jobs ---------- */
@@ -724,14 +868,63 @@ async function loadConfig() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const cfg = await res.json();
     canReveal = !!cfg.can_reveal;
+
+    // Footer: where files are saved.
+    if (cfg.download_dir) els.downloadDir.textContent = cfg.download_dir;
+
+    // Footer: tool versions (yt-dlp + ffmpeg, the mp3/mp4 encoder).
+    const v = cfg.versions || {};
+    const bits = [];
+    if (v.yt_dlp) bits.push("yt-dlp " + escapeHtml(v.yt_dlp));
+    if (v.ffmpeg) bits.push("ffmpeg " + escapeHtml(v.ffmpeg) + " (mp3/mp4 encoder)");
+    els.versions.innerHTML = bits.join('<span class="sep">·</span>');
   } catch (err) {
     canReveal = false; // safe default: show the saved-path label instead
   }
 }
 
+/* ---------- Live updates via Server-Sent Events ---------- */
+// The backend pushes the full jobs snapshot on every change, so there's no
+// polling. If SSE is unavailable or drops for good, we fall back to polling.
+let pollTimer = null;
+
+function startPollingFallback() {
+  if (pollTimer) return;
+  refreshJobs();
+  pollTimer = setInterval(refreshJobs, POLL_MS);
+}
+function stopPollingFallback() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function connectEvents() {
+  if (typeof EventSource === "undefined") {
+    startPollingFallback(); // very old browser
+    return;
+  }
+  const es = new EventSource(API.events);
+
+  es.onmessage = (e) => {
+    stopPollingFallback();   // SSE is working; no need to poll
+    hideBanner();
+    try {
+      const data = JSON.parse(e.data);
+      renderJobs(data.jobs || []);
+    } catch (_) { /* ignore malformed frame */ }
+  };
+
+  es.onerror = () => {
+    // EventSource auto-reconnects; meanwhile poll so the UI keeps updating.
+    showBanner("Reconnecting to the server…");
+    startPollingFallback();
+  };
+}
+
 /* ---------- Boot ---------- */
-loadConfig().then(refreshJobs);
-setInterval(refreshJobs, POLL_MS);
+loadConfig().then(() => {
+  refreshJobs();     // paint immediately
+  connectEvents();   // then switch to live push
+});
 </script>
 </body>
 </html>

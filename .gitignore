@@ -5,6 +5,13 @@ downloads/*.mkv
 downloads/*.avi
 downloads/*.webm
 
+# Staging dir for in-progress / pre-conversion files (never commit this)
+downloads/_incomplete_/
+
+# Job database (app state, not media)
+*.db
+.yt-bckp.db
+
 # Python bytecode
 __pycache__/
 *.pyc
