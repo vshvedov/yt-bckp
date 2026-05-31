@@ -1,5 +1,8 @@
 # Downloaded media
-downloads/
+downloads/*.mp3
+downloads/*.mp4
+downloads/*.mkv
+downloads/*.avi
 
 # Python bytecode
 __pycache__/
