@@ -15,6 +15,7 @@ Endpoints:
     GET  /api/reveal?id=ID  -> reveal a finished file in Finder
 """
 
+import argparse
 import json
 import os
 import re
@@ -129,17 +130,14 @@ def snapshot_jobs():
 # yt-dlp worker
 # --------------------------------------------------------------------------- #
 
-# "[download]  42.3% of  10.50MiB at ..." -> capture the float percentage.
-PROGRESS_RE = re.compile(r"\[download\]\s+([0-9]+(?:\.[0-9]+)?)%")
-
-# Lines that announce where the *final* file lives. yt-dlp prints these after
-# post-processing, so they are more reliable than the JSON for the on-disk name.
-DESTINATION_RE = re.compile(r"\[download\] Destination:\s*(.+)$")
-EXTRACT_AUDIO_RE = re.compile(r"\[ExtractAudio\] Destination:\s*(.+)$")
-MERGER_RE = re.compile(r'\[Merger\] Merging formats into "(.+)"')
-# Final move out of the staging dir into DOWNLOAD_DIR — the authoritative path.
-MOVEFILES_RE = re.compile(r'\[MoveFiles\] Moving file "(.+?)" to "(.+?)"')
-# yt-dlp may report "already been downloaded" instead of re-downloading.
+# We drive yt-dlp's output ourselves with explicit, machine-readable markers
+# (see build_command): a custom --progress-template plus --print lines. This is
+# far more reliable than scraping the human-readable "[download] 42%" output,
+# which yt-dlp suppresses while --print-json is active and emits on stderr.
+PROGRESS_RE = re.compile(r"^PROG\s+([0-9]+(?:\.[0-9]+)?)%")   # download:PROG  42.3%
+TITLE_RE = re.compile(r"^TITLE\s+(.+)$")                       # before_dl:TITLE ...
+DONE_RE = re.compile(r"^DONE\s+(.+)$")                         # after_move:DONE <final path>
+# Fallback only: a finished file that yt-dlp says was already downloaded.
 ALREADY_RE = re.compile(r"\[download\]\s*(.+?)\s+has already been downloaded")
 
 
@@ -169,9 +167,15 @@ def build_command(url, fmt, cookies_browser=None):
     base = [
         YT_DLP,
         "--newline",            # emit progress on its own line so we can parse it
-        "--print-json",         # dump the info dict (one JSON object) to stdout
-        "--no-simulate",        # --print-json implies simulate; force a real download
         "--no-playlist",        # grab ONLY the video in the URL, never its playlist/mix
+        # Force progress onto stdout in a parseable form we control. The default
+        # "[download] 42%" output is human-only and goes to stderr; this template
+        # is emitted reliably on stdout instead.
+        "--progress",
+        "--progress-template", "download:PROG %(progress._percent_str)s",
+        # Emit the title up front and the final on-disk path after the move.
+        "--print", "before_dl:TITLE %(title)s",
+        "--print", "after_move:DONE %(filepath)s",
         "-P", "home:" + DOWNLOAD_DIR,     # finished files are moved here
         "-P", "temp:" + INCOMPLETE_DIR,   # all intermediate work staged here
         "-o", OUTPUT_TEMPLATE,
@@ -212,9 +216,7 @@ def run_download(job_id):
 
     # Captured along the way; reconciled into the final filename at the end.
     title = None
-    info_json = None
-    download_dest = None      # raw container before post-processing
-    final_dest = None         # post-processed final file (mp3 / merged mp4)
+    final_dest = None         # final file path (from our after_move:DONE marker)
     stderr_tail = []          # keep last lines of stderr for error reporting
 
     try:
@@ -249,13 +251,13 @@ def run_download(job_id):
     err_thread = threading.Thread(target=drain_stderr, daemon=True)
     err_thread.start()
 
-    # Parse stdout line by line.
+    # Parse stdout line by line, looking for our explicit markers.
     for raw in proc.stdout:
         line = raw.rstrip("\n")
         if not line:
             continue
 
-        # 1) Progress percentage.
+        # 1) Progress percentage (download:PROG  42.3%).
         m = PROGRESS_RE.search(line)
         if m:
             try:
@@ -264,49 +266,25 @@ def run_download(job_id):
                 pass
             continue
 
-        # 2) Raw download destination (pre post-processing).
-        m = DESTINATION_RE.search(line)
+        # 2) Title, emitted before the download starts (before_dl:TITLE ...).
+        m = TITLE_RE.search(line)
         if m:
-            download_dest = m.group(1).strip()
-            if title is None:
-                title = os.path.splitext(os.path.basename(download_dest))[0]
+            title = m.group(1).strip()
+            update_job(job_id, title=title)
             continue
 
-        # 3) Already-downloaded shortcut: treat as the final file.
+        # 3) Final on-disk path, emitted after the move (after_move:DONE ...).
+        m = DONE_RE.search(line)
+        if m:
+            final_dest = m.group(1).strip()
+            update_job(job_id, progress=100)
+            continue
+
+        # 4) Fallback: yt-dlp skipped the download because the file already exists.
         m = ALREADY_RE.search(line)
         if m:
             final_dest = m.group(1).strip()
             update_job(job_id, progress=100)
-            continue
-
-        # 4) Post-processed audio destination (mp3).
-        m = EXTRACT_AUDIO_RE.search(line)
-        if m:
-            final_dest = m.group(1).strip()
-            continue
-
-        # 5) Merged output destination (mp4).
-        m = MERGER_RE.search(line)
-        if m:
-            final_dest = m.group(1).strip()
-            continue
-
-        # 5b) Final move from the staging dir into DOWNLOAD_DIR (authoritative).
-        m = MOVEFILES_RE.search(line)
-        if m:
-            final_dest = m.group(2).strip()
-            update_job(job_id, progress=100)
-            continue
-
-        # 6) The info JSON dump (a single object printed on one line).
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                info_json = json.loads(line)
-                if info_json.get("title"):
-                    title = info_json["title"]
-                    update_job(job_id, title=title)
-            except json.JSONDecodeError:
-                pass
             continue
 
     proc.stdout.close()
@@ -316,25 +294,15 @@ def run_download(job_id):
     # ----------------------------------------------------------------------- #
     # Resolve the final on-disk filename.
     # ----------------------------------------------------------------------- #
-    filename = final_dest or download_dest
+    filename = final_dest
 
-    # If we only saw the pre-processing path, correct the extension to match the
-    # requested format (yt-dlp rewrites it during post-processing).
-    if filename:
-        wanted_ext = ".mp3" if fmt == "mp3" else ".mp4"
-        base_no_ext = os.path.splitext(filename)[0]
-        candidate = base_no_ext + wanted_ext
+    # Fallback if the DONE marker was missing: look for <title>.<ext> in the
+    # downloads dir (the move target).
+    if (not filename or not os.path.exists(filename)) and title:
+        ext = ".mp3" if fmt == "mp3" else ".mp4"
+        candidate = os.path.join(DOWNLOAD_DIR, title + ext)
         if os.path.exists(candidate):
             filename = candidate
-
-    # Last resort: derive the path from the JSON info dict.
-    if (not filename or not os.path.exists(filename)) and info_json:
-        guess_title = info_json.get("title")
-        if guess_title:
-            ext = ".mp3" if fmt == "mp3" else ".mp4"
-            candidate = os.path.join(DOWNLOAD_DIR, guess_title + ext)
-            if os.path.exists(candidate):
-                filename = candidate
 
     if filename:
         filename = os.path.abspath(filename)
@@ -532,7 +500,43 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 
 
+def parse_args(argv=None):
+    """CLI flags. Each overrides its matching env var / default when given."""
+    parser = argparse.ArgumentParser(
+        prog="yt-bckp",
+        description="Local YouTube downloader (mp3/mp4). Saves to a downloads folder.",
+    )
+    parser.add_argument(
+        "-d", "--dir", metavar="PATH", default=None,
+        help="directory to save finished files in "
+             "(overrides YT_BCKP_DOWNLOAD_DIR; default: ./downloads)",
+    )
+    parser.add_argument(
+        "--host", metavar="ADDR", default=None,
+        help="bind address (overrides YT_BCKP_HOST; default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", type=int, metavar="N", default=None,
+        help="port to listen on (overrides YT_BCKP_PORT; default: 8723)",
+    )
+    return parser.parse_args(argv)
+
+
 def main():
+    # Resolve configuration. Precedence: CLI flag > env var > default. The env
+    # vars were already applied to the module globals at import; a CLI flag, if
+    # present, overrides them here (build_command reads these globals at runtime).
+    global HOST, PORT, DOWNLOAD_DIR, INCOMPLETE_DIR
+
+    args = parse_args()
+    if args.host is not None:
+        HOST = args.host
+    if args.port is not None:
+        PORT = args.port
+    if args.dir is not None:
+        DOWNLOAD_DIR = os.path.abspath(os.path.expanduser(args.dir))
+        INCOMPLETE_DIR = os.path.join(DOWNLOAD_DIR, "_incomplete_")
+
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(INCOMPLETE_DIR, exist_ok=True)
 

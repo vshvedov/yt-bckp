@@ -78,6 +78,21 @@ Open that URL in your browser, paste your YouTube links (one per line), choose a
 format, and hit download. Finished files land in the `downloads/` folder next to
 `server.py`.
 
+### Choosing where files are saved
+
+By default files go to `downloads/` next to `server.py`. To save somewhere else,
+use the `--dir` flag or the `YT_BCKP_DOWNLOAD_DIR` environment variable (the flag
+wins if you use both):
+
+```bash
+python3 server.py --dir ~/Music/yt        # CLI flag (~ and relative paths are fine)
+YT_BCKP_DOWNLOAD_DIR=~/Music/yt python3 server.py   # env var
+```
+
+`--host` and `--port` work the same way (`python3 server.py --port 9000`). See
+`python3 server.py --help` for all flags. In Docker, set the directory by
+mounting a volume at `/downloads` (see [Run on a server](#run-on-a-server-docker)).
+
 ## Restricted videos & "confirm you're not a bot"
 
 By default the app downloads **anonymously** — no login, independent of your browser. That's
@@ -116,6 +131,48 @@ Edit `docker-compose.yml` to suit your setup:
 - **`PUID` / `PGID`** — set these to your user's `id -u` / `id -g` so downloaded
   files are owned by you, not root.
 - **`ports:`** — change the host port if 8723 is taken (`"9000:8723"`).
+
+#### Setting the download directory with Compose
+
+> **Important:** with Docker Compose you do **not** use the `--dir` flag. The
+> download location is controlled by the **volume mount**, not by a CLI flag or by
+> `YT_BCKP_DOWNLOAD_DIR` (which stays at its container default of `/downloads`).
+
+In `docker-compose.yml`, the `volumes` entry has the form `HOST_PATH:/downloads`:
+
+```yaml
+volumes:
+  - /mnt/media/youtube:/downloads   # change ONLY the left side
+```
+
+- **Left of the `:`** = the folder on your server — **change this** to wherever you
+  want files saved.
+- **Right of the `:`** = the path inside the container — **always leave it as
+  `/downloads`**. The app writes there, and the mount maps it to your host folder.
+
+More examples:
+
+```yaml
+- ./downloads:/downloads            # default: a 'downloads' folder next to the compose file
+- /mnt/media/youtube:/downloads     # an absolute path on the server
+- /Volumes/NAS/yt:/downloads        # a mounted NAS share
+```
+
+If you'd rather not edit the YAML, make the host path an environment variable so it
+can come from your shell or a `.env` file next to `docker-compose.yml`:
+
+```yaml
+volumes:
+  - ${YT_DIR:-./downloads}:/downloads
+```
+
+```bash
+YT_DIR=/mnt/media/youtube docker compose up -d
+# or put  YT_DIR=/mnt/media/youtube  in a .env file beside docker-compose.yml
+```
+
+> Make sure the host folder exists and is writable before starting, and set
+> `PUID`/`PGID` (above) so the files aren't owned by root.
 
 Without compose:
 
