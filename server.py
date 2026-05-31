@@ -65,8 +65,12 @@ OPEN_BROWSER = _env_flag("YT_BCKP_OPEN_BROWSER", True)
 # "Reveal in Finder" only makes sense on the local macOS machine.
 CAN_REVEAL = sys.platform == "darwin"
 
-# Output template shared by both formats. yt-dlp expands %(title)s / %(ext)s.
-OUTPUT_TEMPLATE = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+# Intermediate files (partial downloads, pre-merge / pre-extract artifacts) are
+# staged here; yt-dlp moves only the FINISHED, converted file into DOWNLOAD_DIR.
+INCOMPLETE_DIR = os.path.join(DOWNLOAD_DIR, "_incomplete_")
+
+# Output filename template (relative — the directory comes from -P home below).
+OUTPUT_TEMPLATE = "%(title)s.%(ext)s"
 
 # Browsers yt-dlp can pull cookies from via --cookies-from-browser. Used for
 # age-restricted / private videos and to clear "confirm you're not a bot" checks.
@@ -133,8 +137,31 @@ PROGRESS_RE = re.compile(r"\[download\]\s+([0-9]+(?:\.[0-9]+)?)%")
 DESTINATION_RE = re.compile(r"\[download\] Destination:\s*(.+)$")
 EXTRACT_AUDIO_RE = re.compile(r"\[ExtractAudio\] Destination:\s*(.+)$")
 MERGER_RE = re.compile(r'\[Merger\] Merging formats into "(.+)"')
+# Final move out of the staging dir into DOWNLOAD_DIR — the authoritative path.
+MOVEFILES_RE = re.compile(r'\[MoveFiles\] Moving file "(.+?)" to "(.+?)"')
 # yt-dlp may report "already been downloaded" instead of re-downloading.
 ALREADY_RE = re.compile(r"\[download\]\s*(.+?)\s+has already been downloaded")
+
+
+def underscore_filename(path):
+    """
+    Rename a finished file so spaces in its name become underscores
+    (e.g. 'Me at the zoo.mp3' -> 'Me_at_the_zoo.mp3'). Only the filename is
+    touched, never the parent directory. Returns the new path, or the original
+    path unchanged if there are no spaces or the rename fails.
+    """
+    if not path or not os.path.exists(path):
+        return path
+    directory, base = os.path.split(path)
+    underscored = base.replace(" ", "_")
+    if underscored == base:
+        return path
+    target = os.path.join(directory, underscored)
+    try:
+        os.replace(path, target)  # atomic within the same directory
+        return target
+    except OSError:
+        return path  # keep the original name if the rename fails
 
 
 def build_command(url, fmt, cookies_browser=None):
@@ -144,6 +171,9 @@ def build_command(url, fmt, cookies_browser=None):
         "--newline",            # emit progress on its own line so we can parse it
         "--print-json",         # dump the info dict (one JSON object) to stdout
         "--no-simulate",        # --print-json implies simulate; force a real download
+        "--no-playlist",        # grab ONLY the video in the URL, never its playlist/mix
+        "-P", "home:" + DOWNLOAD_DIR,     # finished files are moved here
+        "-P", "temp:" + INCOMPLETE_DIR,   # all intermediate work staged here
         "-o", OUTPUT_TEMPLATE,
     ]
     # Borrow the user's browser cookies for age-restricted / private videos and
@@ -261,6 +291,13 @@ def run_download(job_id):
             final_dest = m.group(1).strip()
             continue
 
+        # 5b) Final move from the staging dir into DOWNLOAD_DIR (authoritative).
+        m = MOVEFILES_RE.search(line)
+        if m:
+            final_dest = m.group(2).strip()
+            update_job(job_id, progress=100)
+            continue
+
         # 6) The info JSON dump (a single object printed on one line).
         if line.startswith("{") and line.endswith("}"):
             try:
@@ -301,6 +338,8 @@ def run_download(job_id):
 
     if filename:
         filename = os.path.abspath(filename)
+        # Store the final file with underscores instead of spaces in its name.
+        filename = underscore_filename(filename)
 
     # ----------------------------------------------------------------------- #
     # Final status transition.
@@ -495,6 +534,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(INCOMPLETE_DIR, exist_ok=True)
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}/"

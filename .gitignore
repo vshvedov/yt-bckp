@@ -3,6 +3,7 @@ downloads/*.mp3
 downloads/*.mp4
 downloads/*.mkv
 downloads/*.avi
+downloads/*.webm
 
 # Python bytecode
 __pycache__/
